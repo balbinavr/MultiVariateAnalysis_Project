@@ -1,0 +1,516 @@
+---
+subtitle: "MVA - Final Project"
+title: "Multivariate Analysis of a Breast Cancer Dataset"
+author: "Carles Garriga Estrade i Balbina Virgili Rocosa"
+date: "06/27/2018"
+output:
+  pdf_document:
+      number_sections: yes
+      keep_tex: yes
+  html_document: default
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library("DMwR")
+library("chemometrics")
+library("VIM")
+library("robustbase")
+library("mice")
+library("mvoutlier")
+library("fBasics")
+library("FactoMineR")
+library("factoextra")
+library("readr")
+library("rgl")
+library("pls")
+library("rpart.plot")
+library("randomForest")
+library("stats")
+library("ROCR")
+source("mahalanobisDistance.R")
+library("VGAM")
+library("caret")
+
+library(dplyr)
+library(ggraph)
+library(igraph)
+knitr::opts_chunk$set(echo = TRUE)
+
+
+tree_func <- function(final_model, 
+                      tree_num) {
+    
+    # get tree by index
+    tree <- randomForest::getTree(final_model, 
+                                  k = tree_num, 
+                                  labelVar = TRUE) %>%
+        tibble::rownames_to_column() %>%
+        # make leaf split points to NA, so the 0s won't get plotted
+        mutate(`split point` = ifelse(is.na(prediction), `split point`, NA))
+    
+    # prepare data frame for graph
+    graph_frame <- data.frame(from = rep(tree$rowname, 2),
+                              to = c(tree$`left daughter`, tree$`right daughter`))
+    
+    # convert to graph and delete the last node that we don't want to plot
+    graph <- graph_from_data_frame(graph_frame) %>%
+        delete_vertices("0")
+    
+    # set node labels
+    V(graph)$node_label <- gsub("_", " ", as.character(tree$`split var`))
+    V(graph)$leaf_label <- as.character(tree$prediction)
+    V(graph)$split <- as.character(round(tree$`split point`, digits = 2))
+    
+    # plot
+    plot <- ggraph(graph, 'dendrogram') + 
+        theme_bw() +
+        geom_edge_link() +
+        geom_node_point() +
+        geom_node_text(aes(label = node_label), na.rm = TRUE, repel = TRUE) +
+        geom_node_label(aes(label = split), vjust = 2.5, na.rm = TRUE, fill = "white") +
+        geom_node_label(aes(label = leaf_label, fill = leaf_label), na.rm = TRUE, 
+                        repel = TRUE, colour = "white", fontface = "bold", show.legend = FALSE) +
+        theme(panel.grid.minor = element_blank(),
+              panel.grid.major = element_blank(),
+              panel.background = element_blank(),
+              plot.background = element_rect(fill = "white"),
+              panel.border = element_blank(),
+              axis.line = element_blank(),
+              axis.text.x = element_blank(),
+              axis.text.y = element_blank(),
+              axis.ticks = element_blank(),
+              axis.title.x = element_blank(),
+              axis.title.y = element_blank(),
+              plot.title = element_text(size = 18))
+    
+    print(plot)
+}
+
+set.seed(7)
+
+getAccuracy <- function(predictions, labels, threshold) {
+     # ROC CURVE
+     pred <- prediction(predictions, labels)
+     perf <- performance(pred, measure = "tpr", x.measure = "fpr") 
+     plot(perf, col=rainbow(10))
+     
+     #ESTABLISH 0.6 as threshold
+     predictions <- sapply(predictions, function (value) {
+         if (value > threshold) return(TRUE)
+         else return(FALSE)
+     })
+     
+     count = 0
+     i = 1
+     for (label in labels) {
+         if (label == predictions[i]) {
+             count =  count + 1;
+         }
+         i = i + 1
+     }
+     
+     acc <- 100.0*(count/length(labels))
+     
+     
+     return(acc)
+ }
+```
+\newpage
+\tableofcontents
+\newpage
+
+#Introduction
+
+Breast cancer is known to be the most occurred cancer for women worldwide and one of the most common cancer that causes death. During the past decade, breast cancer has been deeply studied and thanks to it, an increase on the prognosis rate and a decrease on death rate have been achieved. Nevertheless, further research is still needed to achieve full understanding of its mechanism and corresponding efficient treatment. It is known to happen because most cancer treatments tend to be too general, since the doctors normally give patients of different characteristics similar suggestions. But the usage of statistical methods to understand cancer pretend to improve the prediction of cancer and easily identify significant genes to be able to apply a more specific treatment to each patient.
+
+The main objective of this project is to successfully develop a multivariate analysis from a chosen dataset, which contains information about breast cancer of many different patients. More concretely, we want to, finally, be able to create a good model to predict a possible eventual death of patients that suffer breast cancer.
+
+
+#The Dataset
+
+The chosen dataset is called \textit{NKI Breast Cancer} and its data is collected by NKI (Netherlands Cancer Institute). The dataset contains information of 272 breast cancer patients and 1570 attributes for each of them, which include 3 patient related attributes, 13 clinical attributes and 1554 gene attributes. More detailed, the attributes recorded for each patient are the following ones:
+
+\begin{itemize}
+	\item \textit{Patient}: [String] categorical patient identifier.
+  \item \textit{Id}: [Integer] numerical patient identifier.
+  \item \textit{Age}: [Integer] patient age.
+  \item \textbf{Eventdeath}: [Boolean] whether the patient died of breast cancer or not. This is the value that we are interested in predicting for each individual.
+  \item \textit{Survival}: [Float] survival time.
+  \item \textit{Timerecurrence}: [Float] recurrence time. It is generally the same as survival time when the patient did not die from breast cancer and, in other cases, it is smaller.
+  \item \textit{Chemo}: [Boolean] whether the patient has received a chemotherapy or not.
+  \item \textit{Hormonal}: [Boolean] whether the patient has received hormonal therapy or not.
+  \item \textit{Amputation}: [Boolean] whether forequarter amputation has been used as a treatment or not.
+  \item \textit{Histtype}: [Factor] histological type, which refers to the growth pattern of the tumors.
+  \item \textit{Diam}: [Integer] diameter of the tumor size.
+  \item \textit{Posnodes}: [Integer] number of positive nodes.
+  \item \textit{Grade}: [Factor] three levels indicating cancer grade, which is an indicator of how quickly a tumor is likely to grow and spread.
+  \item \textit{Angioinv}: [Factor] three levels indicating the extent to which the cancer has invaded blood vessels.
+  \item \textit{Lymphinfil}: [Factor] three levels indicating the level of lymphocytic infiltration.
+  \item \textit{Barcode}: Clinical patient identifier.
+  \item \textbf{Gene attributes}: [1554 Float] 
+\end{itemize}
+
+
+```{r, echo=FALSE, results='hide'}
+NKI_initial <- as.data.frame(
+    read_csv("NKI_cleaned.csv", 
+                        col_types = cols(amputation = col_logical(), 
+                                         eventdeath = col_logical(), 
+                                         angioinv = col_factor(levels = c("1","2", "3")), 
+                                         chemo = col_logical(), 
+                                         grade = col_factor(levels = c("1","2", "3")), 
+                                         histtype = col_factor(levels = c("1", "2", "4", "5", "7")), 
+                                         hormonal = col_logical(), 
+                                         lymphinfil = col_factor(levels = c("1","2", "3")))))
+
+```
+
+As we can realize, \textbf{our dataset has more variables than individuals.}
+
+
+#The Pre-process of Data
+Data is likely to contain many errors, be incomplete or inconsistent. That is why data preprocessing is needed to deal with those issues to prepare the data for further analysis / processing. Once the dataset has been loaded, the first step that must be done is the pre-processing of the data. For it, the following techniques have been studied and applied to our chosen dataset.
+
+##Missing values
+
+As we already know, missing values are represented with the missing code NA by default. That is why, its evaluation has been performed by searching for NA values on the loaded dataset. With the results retrieved, we can confirm that there are no missing values on the given data so no further treatment is needed to be done to be able to compute them.
+
+```{r, echo=FALSE, results='hide'}
+sum(is.na(NKI_initial))
+```
+
+
+##Feature selection
+
+Afterwards, we have analyzed the different attributes given for each individual. At first glance, we have realized that Patient, Id and Barcode do not contribute with any useful information for the further analysis, as all of them are just unique identifiers of each patient of the dataset. Therefore, all of them are removed from the dataset.
+
+```{r, echo=FALSE, results='hide'}
+rowsToRemove = c("barcode", "ID", "Patient")
+NKI <- NKI_initial[ , -which(names(NKI_initial) %in% rowsToRemove)]
+
+```
+
+Furthermore, we have performed a correlation analysis for the numerical clinical variables (excluding the gene ones) in order to avoid co-linear variables. That is why we have computed the correlation between variables and we have identified the ones that are highly correlated (\> 0.9). With the results retrieved, we can see that survival and timerecurrence are highly correlated, and we have decided to delete survival to not produce multicollinearity in an independent variable.
+
+
+
+```{r, out.width='.60\\linewidth', fig.height=3.55,fig.show='hold',fig.align='center', results='hide', echo=FALSE}
+corrplot(cor(NKI[,c(1, 3:4, 9)]), xlab="", ylab="")
+# columnsToDrop <- findCorrelation(cor(NKI[,c(1, 3:4, 9)]), cutoff = 0.9, names=TRUE)
+# NKI <- NKI[ , -which(names(NKI) %in% columnsToDrop)]
+NKI <- NKI[,-3]
+detach("package:caret", unload=TRUE)
+first_gene <- grep("esr1", colnames(NKI))
+first_gene
+```
+
+
+##Outlier detection
+
+Another factor that we need to take into account are the outliers of our data. In order to detect and remove them, two methods can be used. As our dataset has more columns than individuals, we are not allowed to implement the first implemented method that uses the Mahalanobis distance and the principal components.
+
+Then, a second method, based on the local outlier factor, is applied. It provides a score based on the distance of a point to its k-nearest neighbors (density of the neighborhood) compared with the density of the neighbors of the first point (distances of the k-nearest neighbors of the neighbor). The resulting score value for each point determines if the individual would be considered an outlier or not.
+
+
+```{r, out.width='.80\\linewidth', fig.height=4.55,fig.show='hold',fig.align='center', results='hide', echo=FALSE}
+# LOF
+foundOutliersLOF.scores <- lofactor(NKI[, first_gene:nrow(NKI)], k=5)
+plot(foundOutliersLOF.scores)
+foundOutliersLOF = order(foundOutliersLOF.scores, decreasing=T)
+rownames(NKI)[foundOutliersLOF]
+```
+
+With the results retrieved, we can see that most of the individuals lie between 0 and 2, and there are just a few individuals that have an score value calculated above 2, which we could detect as outliers. But the individual with the higher score calculated is 3.5, so we think that the difference is not high enough to be considered as outliers.
+
+##Feature extraction
+
+Finally, as having a large number of variables makes the data quite difficult to treat, we have reduced the dimensionality of the data, by substituting all the gene attributes for its most important principal components.
+
+To do it, we have performed a principal components regression (PCR) to all gene attributes (variables 13 to 1566 of the dataset). The basic idea behind PCR is to calculate the principal components of the desired data and then use some of these components as predictors in a linear regression model fitted using the typical least squares procedure. The linear model defined has been the eventdeath as response variable taking into consideration all the other variables of the training set. 
+
+For being able to reduce the dimensionality with PCR, we need to decide which number of components is the best one, by obtaining the minimum number of components that keep most of the variability of the original variables and the ones that maximizes the R2 and minimizes the MSEP the most. With the results obtained, we can see that the number of components that we need to define are the first 21.
+
+```{r, out.width='.80\\linewidth', fig.height=4.55,fig.show='hold',fig.align='center', results='hide', echo=FALSE}
+pcr_model <- pcr(eventdeath ~ ., data = NKI[,c(2, first_gene:ncol(NKI))], scale=TRUE, validation = "CV") # validations = "LOO"
+validationplot(pcr_model, val.type = "R2")
+```
+
+```{r, out.width='.80\\linewidth', fig.height=4.55,fig.show='hold',fig.align='center', results='hide', echo=FALSE}
+validationplot(pcr_model, val.type = "MSEP")
+```
+
+```{r, echo=FALSE, results='hide'}
+NKI_comp <- cbind(NKI[, 1:(first_gene-1)], pcr_model$scores[, 1:21])
+```
+
+We finally join the first 12 variables of the data (regarding clinical attributes) with the new calculated ones, which have reduced the dimensionality of the gene attributes. This way, we have been able to reduce the dimensionality of the whole data from 1566 to 33. Therefore, now, \textbf{our dataset has more individuals than variables} and it will be easier to treat and extract latent information than from the initial dataset.
+
+So, the current dimensions of the data, after performing the whole preprocessing, are the following ones. Note that the number of individuals remains the same.
+
+```{r, echo=FALSE}
+colnames(NKI_comp)
+```
+
+
+#The Protocol of Validation
+
+As we have already stated before, the total number of individuals that our dataset has is 272.
+Even it is not a very large number, we have preferred to apply the Holdout method for selecting a validation dataset because we have few patients that differ much to the others and we think that Leave-One-Out method would perform worse on our data.
+
+So, using the Holdout method, we have separated the data into testing set (20\% of data) and training set (80\% of data remaining).
+
+```{r, echo=FALSE, results='hide'}
+test_threshold = 0.2
+test_df = NKI_comp[1:(test_threshold*nrow(NKI_comp)),]
+train_df = NKI_comp[(test_threshold*nrow(NKI_comp)):nrow(NKI_comp),]
+
+train_df_comp <- train_df
+pred_df <- test_df
+```
+
+#Data visualization
+
+##Factorial analysis on Mixed Data
+
+After developing the whole preprocessing and defining the protocol of validation, our newly merged dataset contains both qualitative and quantitative data. This introduces us the problem of having to compute both the principal component analysis (for quantitative variables) and multiple correspondence analysis (for qualitative data). However, factoMineR provides a principal component method that allows to have mixed type data: Factor Analysis for Mixed type Data (or FAMD). As a matter fact, this method can be interpreted as a PCA on the quantitative data and MCA on the qualitative one. During this analysis, the training set of the data are used as active data, while the test individuals and the evendeath variable are taken as supplementary.
+
+```{r echo=FALSE}
+famd.NKI <- FAMD(NKI_comp, ncp = nrow(NKI_comp), sup.var=2, ind.sup = 1:nrow(pred_df), graph = FALSE)
+eig.val <- as.data.frame(get_eigenvalue(famd.NKI))
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+par(mfrow=c(1,2), cex.axis=0.5, cex.lab=0.7, cex.main=0.7, cex.sub=0.7)
+plot(eig.val$cumulative.variance.percent, type="b")
+
+plot(eig.val$eigenvalue, type="b")
+abline(h = mean(eig.val$eigenvalue), lty = 2)
+```
+
+After obtaining the eigenvalues, we can compute the cumulative percentage of variance that each dimension represents (up to). Unfortunately, as we can see on the graphics retrieved, the cumulative variance percentages are represented as an "almost" linear distribution, which trades of as having similar percentage of variance represented per each dimension. And we are able to see that, taking into account only the first factorial plane, only the 13% of total variance is represented. So many dimensions should be kept in order to explain the significant percentage of the total inertia (\> 90\%).
+
+```{r, out.width='.80\\linewidth', fig.height=4.55,fig.show='hold',fig.align='center', results='hide', echo=FALSE, message=FALSE, warning=FALSE}
+
+# Plot of variables
+fviz_famd_var(famd.NKI, repel = TRUE)
+```
+
+Moreover, plotting the variables in the first factorial plane allows us to distinguish several hidden groups:
+
+*   A first group, that is based on the components *Comp x* extracted by the previous PCR execution. They don't represent much variance as the rest of factors in the first two dimensions. *hormonal*, *histtype* and *age* could also be relatable to those components.
+*   A second group based on *angionv*, being related in nearly the same measure to both first and second dimensions.
+*   A third group based on *grade*, *lymphinfil* and *diam*, being the most related to the first dimension. An hidden relationship could be explained, where the level of lymphocytic infiltration could determine the general grade of the tumor, also involving the firs component and the diameter of the tumor.
+*   Finally a last group based on *chemo* and *posnodes*, being the most related to the second dimension, could be related. As higher is the number of tumor nodes, more chances that a chemotherapy should be done. *amputation* could also be realatable to this group.
+
+```{r, out.width='.80\\linewidth', fig.height=4.55,fig.show='hold',fig.align='center', results='hide', echo=FALSE, message=FALSE, warning=FALSE}
+# Contribution to the first dimension
+fviz_contrib(famd.NKI, "var", axes = 1)
+```
+
+From the dimension point of view, *grade* , *Comp 1* and *lymphinfil* are the ones that contribute the most to the first dimension, followed by nearly the rest of the categorical factors. On the other side, the rest of the components *Comp x* are the one that contribute the less as well as hormonal.
+
+```{r, out.width='.80\\linewidth', fig.height=4.55,fig.show='hold',fig.align='center', results='hide', echo=FALSE, message=FALSE, warning=FALSE}
+# Contribution to the second dimension
+fviz_contrib(famd.NKI, "var", axes = 2)
+```
+For the second dimension, *chemo* , *posnodes* and *amputation* are the one that contribute the most to the first dimension, followed by nearly the rest of the categorical factors. On the other side (and the same as before) some components *Comp x* as well as time recurrence are the ones that contribute the less.
+
+```{r, out.width='.80\\linewidth', fig.height=4.55,fig.show='hold',fig.align='center', results='hide', echo=FALSE, message=FALSE, warning=FALSE}
+# Plot of individuals
+fviz_famd_ind(famd.NKI, col.ind.sup = "red")
+```
+
+For the plot of individuals, we can observe a cloud with density near the center of the axis with a shape similar to an ellipsoid. However, several individuals remain outside of it and thus, being clearly entirely related to the first or second dimension  (eg. 151, 53, 262 etc). Supplementary individuals (shown in red) could be considered inside the ellipsoid and they seem to don't provide any drastic difference regarding the rest of the individuals in the first factorial plane.
+
+However, we need to keep in mind that the first factorial plane, due to its low percentage of variance (~12%), cannot be used to represent the majority of variance explained by the dataset.
+
+##Clustering
+
+Once having explored the hidden factors, we want to see if there is any available split for our individuals into clusters, in order to be able to characterize them. Our approach will be based on a consolidation clustering, where, first, an inital hierachical clustering is applied using the training set.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+d <- dist(rbind(famd.NKI$ind$coord), method = "euclidean")
+par(mfrow=c(1,2), cex.axis=0.5, cex.lab=0.7, cex.main=0.7, cex.sub=0.7)
+hc <- hclust(d, method = "ward.D2")
+plot(hc)
+abline(h=24, col = 2)
+
+barplot(hc$height, main="Heights")
+abline(h=24, col = 2)
+```
+
+The resulting dendogram shows a uneven distribution of splits of individuals, which translates having more difficulties finding a suitable cut. An initial cut could be materialized into 2 classes. To guarantee that this cut is feasible, the depth of the number of clusters that this cut is going apply is revised (in the barplot of heights). Furthermore, the largest depth in the barplot of heights ends up being the cut that we want to apply. Other number of clusters could have been choosed but we decided to ensure not to have much numerous and complex clusters.
+
+After deciding the number of clusters, one only iteration of k-means is executed. Hovewer, consolidation is applied using the centers calculated from the FAMD individuals coordinates.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+nc = 2
+c1 <- cutree(hc,nc)
+cdg<- aggregate(as.data.frame(famd.NKI$ind$coord),list(c1),mean)[,2:(ncol(famd.NKI$ind$coord)+1)]
+Bss <- sum(rowSums(cdg^2)*as.numeric(table(c1)))
+Tss <- sum(rowSums(famd.NKI$ind$coord^2))
+Ib2 <- 100*Bss/Tss
+```
+
+The quality of the cut gives us a low value of `r Ib2`%. This low value can be a consequence of the decision of splitting the populations in only two clusters of individuals.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+kmeans = kmeans(as.data.frame(famd.NKI$ind$coord), centers=cdg)
+
+Bss <- sum(rowSums(kmeans$centers^2)*kmeans$size)
+Wss <- sum(kmeans$withinss)
+Ib2 <- 100*Bss/(Bss+Wss)
+```
+
+After having executed kmeans, we recompute the quality of the clustering: `r Ib2`%. Although there has been improved with regards to hierarchical clustering, we still consider it a low value.
+
+```{r, out.width='.80\\linewidth', fig.height=4.55,fig.show='hold',fig.align='center', results='hide', echo=FALSE, message=FALSE, warning=FALSE}
+
+plot(famd.NKI$ind$coord[,1], famd.NKI$ind$coord[,2], col = kmeans$cluster)
+```
+
+Displaying the first factoral plane using the clusters as colors, allows us to see the splitting between individuals. However, due to the low variance percentage given, we still rely on the rest of dimensions in order to have a major variance explained.
+
+Finally, the characteristics of each cluster are computed using the *catdes* method.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+catdesPlot = catdes(cbind(as.factor(kmeans$cluster),train_df_comp),1)
+catdesPlot
+```
+
+The first cluster can be identified by having:
+
+*   Quantitative variables:
+
+    +   Lower value on the fifth component *Comp 5* than the average.
+
+The second cluster can be identified by having:
+
+*   Quantitative variables:
+
+    +   Higher value on the fifth component *Comp 5* than the average.
+
+
+# Predictive methods
+
+Finally, we have developed three different models to predict a possible eventual death of patients that suffer breast cancer. Thanks to having a separated test set, we have 3 models, which have been previously trained with the training set, to test against unseen data.
+
+## Generalized linear model
+
+The first method used is a linear regression, via a generalized linear model with binomial family in order to predict binary outcomes. To do so, the glm function has been used by defining the appropriate formula for predicting the eventdeath variable taking into consideration all the other variables of the training set.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+pred <- glm(eventdeath ~ ., data=as.data.frame(train_df_comp), family=binomial())
+    
+predictedData <- predict(pred, newdata=pred_df, type="response")
+
+glm_acc <- getAccuracy(predictedData, pred_df[, 2], 0.65)
+```
+
+After setting a threshold for predicting the binary class (given probabilities), the accuracy achieved is `r glm_acc` %.
+
+## Decision Trees
+
+Once our data of test and training has been defined, we are able to obtain the decision tree to predict the variable eventdeath on the training data. To do so, the rpart function has been used by defining the appropriate formula for predicting the eventdeath variable taking into consideration all the other variables of the training set and also defining the complexity parameter and the number of cross-validations for our model. The visual representation of the cross-validation results obtained for our calculated decision tree are showed below.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train_df_comp$eventdeath <- factor(train_df_comp$eventdeath)
+
+p2 = rpart(eventdeath~., data=train_df_comp, control=rpart.control(cp=0.001, xval=10))
+
+rpart.plot(p2)
+```
+
+We know that we obtain the optimal tree by pruning the maximal one up to the minimal cross-validation error. To decide the cutoff value for taking the decision more precisely, we have calculated the minimum error of our decision tree model.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE }
+predictedData <- predict(p2, pred_df[,-2], type="class")
+
+acc <- (length(which (predictedData == pred_df[,2], TRUE))/nrow(pred_df)) * 100.0
+
+p2$cptable = as.data.frame(p2$cptable) 
+ind = which.min(p2$cptable$xerror) 
+xerr <- p2$cptable$xerror[ind]
+xstd <- p2$cptable$xstd[ind]
+
+i= 1
+while (p2$cptable$xerror[i] > xerr+xstd) {
+    i = i+1
+    alfa = p2$cptable$CP[i]
+}
+# AND PRUNE THE TREE ACCORDINGLY
+p1 <- prune(p2,cp=alfa)
+
+rpart.plot(p1)
+
+# p1$variable.importance
+```
+
+After the tree is prunned, we predict the test samples. The resulting accuraccy is `r acc`%. We are surprised by the simplicity of the tree, only depending in one variable (among the 33 actual ones) extracted from the training samples. 
+
+## Random Forest
+
+Finally, a random forest has been also developed.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train_df_comp$eventdeath <- as.character(train_df_comp$eventdeath)
+train_df_comp$eventdeath <- as.factor(train_df_comp$eventdeath)
+pred_df[,2] <- as.character(pred_df[,2])
+pred_df[,2] <- as.factor(pred_df[,2])
+
+names(pred_df) <- make.names(names(train_df_comp))
+names(train_df_comp) <- make.names(names(train_df_comp))
+
+p1.rf = randomForest(formula = eventdeath ~ ., data = train_df_comp,
+              importance = TRUE, xtest = pred_df[, c(1, 3:ncol(pred_df)) ], 
+             ytest = pred_df[ , 2], ntree = 2000, nodesize = 20, keep.forest=TRUE)
+
+accrf <- (length(which (p1.rf$test$predicted == pred_df[,2], TRUE))/nrow(pred_df)) * 100.0
+
+plot(p1.rf)
+```
+
+In order to obtain the maximum possible accuracy, we have searched for the parameters that maximize the accuracy:
+
+*   ntree: Being the number of trees to create, this parameter is left with a high value (2000). The larger the value the maximum number of trees are created.
+
+*   nodesize: Minimum size of terminal nodes. Setting this number larger causes smaller trees to be grown (and thus take less time). The best value found is 20.
+
+*   mtry: Number of variables randomly sampled as candidates at each split. This parameter is left in default (since we do classification) being sqrt(#factors).
+
+The maximum accuracy obtained for the the random forests is `r accrf` which seems to be lower than the previous decision tree's `r acc` . However random forests have a higher computational time, no prunning to obtain the optimal solution is needed.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+tree_func(p1.rf, 8)
+```
+
+Taking a look at the tree that resulted the best test accuracy, we can observe that the complexity (in terms of tree size and depth) is quite higher compared to the decicion tree, which only a single timerecurrence decision is needed.
+
+
+#Conclusions
+
+After finishing this project, the main conclusions that we would like to state are the following ones.
+
+*   We think that we have been able to perform a multiple variate analysis from a chosen dataset, by deeply analyzing and understanding the difficulties that the given data contained.
+
+*   We have realized the importance of performing a good preprocessing of the data to be able to obtain good results on the predictions.
+
+*   We have been able to apply a PCA to a dataset that contains more variables than individuals, realizing that the maximum number of dimensions is set to the number of variables of the dataset.
+
+*   We have been able to analyze and perform a dimensionality reduction from a dataset with a huge number of variables.
+
+*   Having mixed type data has brought us the oportunity to use Factor Analysis on Mixed type Data, this way, we have been able to compare categorical with continuous data.
+
+*   High difficulty of a cluster based spliting in hierarchical clustering has forbidden us a higher partition regarding the number of clusters. The quality of the cuts have been remained low despite applying consolidation clustering due to the number of clusters.
+
+*   It is needed to define a protocol of validation before using prediction models taking into account the length of individuals data. Houldout method should be used when it is possible.
+
+*   Training set should be representative of the whole data, meaning that all test set should not differ much from the observations calculated on the training set.
+
+*   Comparing the accuracy of the predictors, the linear regression is the one providing better validation accuracy.
+
+*   Even having a higher computational time and complexity, random forest has proven to be the worst predictor.
+
+To conclude, we would like to add that we are glad to have been able to apply many different concepts learnt during the semester on a real dataset.

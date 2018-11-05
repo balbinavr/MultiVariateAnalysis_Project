@@ -1,0 +1,367 @@
+---
+title: "Project"
+author: "Carles Garriga Estrade & Balbina Virgili Rocosa"
+date: "27/6/2018"
+output: pdf_document
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+library("DMwR")
+library("chemometrics")
+library("VIM")
+library("robustbase")
+library("mice")
+library("mvoutlier")
+library("fBasics")
+library("FactoMineR")
+library("factoextra")
+library("readr")
+library("rgl")
+library("pls")
+library("rpart.plot")
+library("randomForest")
+library("stats")
+library("ROCR")
+source("mahalanobisDistance.R")
+library("VGAM")
+
+library(dplyr)
+library(ggraph)
+library(igraph)
+knitr::opts_chunk$set(echo = TRUE)
+
+
+tree_func <- function(final_model, 
+                      tree_num) {
+    
+    # get tree by index
+    tree <- randomForest::getTree(final_model, 
+                                  k = tree_num, 
+                                  labelVar = TRUE) %>%
+        tibble::rownames_to_column() %>%
+        # make leaf split points to NA, so the 0s won't get plotted
+        mutate(`split point` = ifelse(is.na(prediction), `split point`, NA))
+    
+    # prepare data frame for graph
+    graph_frame <- data.frame(from = rep(tree$rowname, 2),
+                              to = c(tree$`left daughter`, tree$`right daughter`))
+    
+    # convert to graph and delete the last node that we don't want to plot
+    graph <- graph_from_data_frame(graph_frame) %>%
+        delete_vertices("0")
+    
+    # set node labels
+    V(graph)$node_label <- gsub("_", " ", as.character(tree$`split var`))
+    V(graph)$leaf_label <- as.character(tree$prediction)
+    V(graph)$split <- as.character(round(tree$`split point`, digits = 2))
+    
+    # plot
+    plot <- ggraph(graph, 'dendrogram') + 
+        theme_bw() +
+        geom_edge_link() +
+        geom_node_point() +
+        geom_node_text(aes(label = node_label), na.rm = TRUE, repel = TRUE) +
+        geom_node_label(aes(label = split), vjust = 2.5, na.rm = TRUE, fill = "white") +
+        geom_node_label(aes(label = leaf_label, fill = leaf_label), na.rm = TRUE, 
+                        repel = TRUE, colour = "white", fontface = "bold", show.legend = FALSE) +
+        theme(panel.grid.minor = element_blank(),
+              panel.grid.major = element_blank(),
+              panel.background = element_blank(),
+              plot.background = element_rect(fill = "white"),
+              panel.border = element_blank(),
+              axis.line = element_blank(),
+              axis.text.x = element_blank(),
+              axis.text.y = element_blank(),
+              axis.ticks = element_blank(),
+              axis.title.x = element_blank(),
+              axis.title.y = element_blank(),
+              plot.title = element_text(size = 18))
+    
+    print(plot)
+}
+
+set.seed(7)
+
+getAccuracy <- function(predictions, labels, threshold) {
+     # ROC CURVE
+     pred <- prediction(predictions, labels)
+     perf <- performance(pred, measure = "tpr", x.measure = "fpr") 
+     plot(perf, col=rainbow(10))
+     
+     #ESTABLISH 0.6 as threshold
+     predictions <- sapply(predictions, function (value) {
+         if (value > threshold) return(TRUE)
+         else return(FALSE)
+     })
+     
+     count = 0
+     i = 1
+     for (label in labels) {
+         if (label == predictions[i]) {
+             count =  count + 1;
+         }
+         i = i + 1
+     }
+     
+     acc <- 100.0*(count/length(labels))
+     
+     
+     return(acc)
+ }
+
+NKI_initial <- as.data.frame(
+    read_csv("NKI_cleaned.csv", 
+                        col_types = cols(amputation = col_logical(), 
+                                         eventdeath = col_logical(), 
+                                         angioinv = col_factor(levels = c("1","2", "3")), 
+                                         chemo = col_logical(), 
+                                         grade = col_factor(levels = c("1","2", "3")), 
+                                         histtype = col_factor(levels = c("1", "2", "4", "5", "7")), 
+                                         hormonal = col_logical(), 
+                                         lymphinfil = col_factor(levels = c("1","2", "3")))))
+
+rowsToRemove = c("barcode", "ID", "Patient", "survival")
+NKI <- NKI_initial[ , -which(names(NKI_initial) %in% rowsToRemove)]
+
+test_threshold = 0.2
+test_df = NKI[1:(test_threshold*nrow(NKI)),]
+train_df = NKI[(test_threshold*nrow(NKI)):nrow(NKI),]
+
+first_gene <- grep("esr1", colnames(NKI))
+
+
+pcr_model <- pcr(eventdeath~., data = NKI[,c(2, first_gene:ncol(NKI))], scale=TRUE, validation = "CV") # validations = "LOO"
+train_df_comp <- cbind(train_df[, 1:(first_gene-1)], pcr_model$scores[(nrow(test_df)+1):nrow(NKI), 1:21])
+pred_df <- cbind(test_df[, 1:(first_gene-1)], pcr_model$scores[1:nrow(test_df), 1:21])
+NKI_comp <- rbind(pred_df, train_df_comp)
+```
+
+#Data visualization
+
+##Factorial analysis on Mixed Data
+
+After preprocessing and feature extraction, our newly merged dataset contains both qualitative and quantitative data. This introduces us the problem of having to compute both the principal component analysis (for quantitative variables) and multiple correspodance analysis (for qualitative data). However, factoMineR provides a principal component method that allows to have mixed type data: Factor Analysis for Mixed type Data (or FAMD). As a matter fact, this method can be intepreted as a PCA on the quantitative data and MCA on the qualitative one. The test individuals are taken as supplementary.
+
+```{r echo=FALSE}
+famd.NKI <- FAMD(as.matrix(as.data.frame(NKI_comp)), ncp = nrow(NKI_comp), sup.var=2, ind.sup = 1:nrow(test_df), graph = FALSE)
+eig.val <- as.matrix(as.data.frame(get_eigenvalue(famd.NKI)))
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+par(mfrow=c(1,2), cex.axis=0.5, cex.lab=0.7, cex.main=0.7, cex.sub=0.7)
+plot(eig.val$cumulative.variance.percent, type="b")
+
+plot(eig.val$eigenvalue, type="b")
+abline(h = mean(eig.val$eigenvalue), lty = 2)
+```
+
+Taking the eigenvalues, we can computes de comulative percentage of variance that each dimension represents (up to). Unfortunatelly, the cumluative variance percentages is represented as "near" linear, which trades of as having similar percentage of variance represented per each dimension. Taking into account only the first factorial plane, only a 12% of variance is represented.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+# Plot of variables
+fviz_famd_var(famd.NKI, repel = TRUE)
+```
+
+Plotting the variables in the first factorial plane allows us to distinguish several hidden groups:
+
+*   A first group, that is based on the components *Comp x* extracted by the previous PCR execution. They dont represent much variance as the rest of factors in the first two dimensions.
+*   A second group based on *age* and *hormonal*, being related in the first two dimensions but more tied two the second one. A third variable relatable to this group could be the *Comp 8*.
+*   A third group based on *angionv* and *amputation*, being related in nearly the same measure to both first and second dimensions. This relationship could explain that the grade of pensetration of the tumor to the blood vessels could end up in an amputiation in order to preserve the life of the patient. Not that far away, *hysttipe* and *timerecurrence* could also be minimally relatable to those factors, representing a relationship between time of having again the tumor and the hystological type (growth pattern) of it.
+*   A fourth group based on *grade* and *lymphinfil*, being the most related to the second dimension. An hidden relationship could be explained, where the level of lymphocytic infiltration could determine the general grade of the tumor.
+*   Finally a fifth group based on *chemo* and *posnodes*, being the most related to the first dimension, could be related. As higher is the number of tumor nodes, more chances that a chemotherapy should be done.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Contribution to the first dimension
+fviz_contrib(famd.NKI, "var", axes = 1)
+```
+
+From the dimension point of view, *posnodes* , *chemo* and *diam* are the one that contribute the most to the first dimension, followed by nearly the rest of the categorical factors. On the other side, components *Comp x* are the one that contribute the less.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Contribution to the second dimension
+fviz_contrib(famd.NKI, "var", axes = 2)
+```
+For the second dimension, *lymphinfil* , *grade* and *hormonal* are the one that contribute the most to the first dimension, followed by nearly the rest of the categorical factors. On the other side (and the same as before) components *Comp x* are the one that contribute the less.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Plot of individuals
+fviz_famd_ind(famd.NKI, col.ind.sup = "red")
+```
+
+For the plot of individuals, we can observe a cloud with density near the center of axis with a shape similar to an ellipsoid. However, several individuals remain outside of it and thus, being clearly entirely relatable to the first or second dimension  (eg. 151, 169, 173 etc). Supplementary individuals (shown in red) could be considered inside the ellipsoid or don't provide any drastic difference regarding the rest of the individuals in the first factorial plane.
+
+However, we need to keep in mind that the first factorial plane, due to its low percentage of variance (~12%) cannot be used to represent the majority of variance explained by the dataset.
+
+##Clustering
+
+Once having explored the hidden factors, we want to see if there is any available split for our individuals into clusters, in order to be able to characterize them. Our approach will be based on a consolidation clustering, where:
+
+*   An inital hierachical clustering is applied using the training sample.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+d <- dist(rbind(famd.NKI$ind$coord), method = "euclidean")
+par(mfrow=c(1,2), cex.axis=0.5, cex.lab=0.7, cex.main=0.7, cex.sub=0.7)
+hc <- hclust(d, method = "ward.D2")
+plot(hc)
+abline(h=24, col = 2)
+
+barplot(hc$height, main="Heights")
+abline(h=24, col = 2)
+```
+
+The resulting dendogram shows a uneven distribution of splits of individuals, which translates having more difficulties finding a suitable cut. An initial cut could be materialized into 2 classes. To guarantee that this cut is feasible, the depth of the number of clusters that this cut is going apply is revised (in the barplot of heights). Furthermore, the largest depth in the barplot of heights ends up being the cut that we want to apply. Other number of clusters could have been choosed (e.g: 21 cuts) but we decided to ensure not to have such numerous and complex clusters.
+
+After deciding the number of clusters, one only iteration of k-means is executed. Hovewer, consolidation is applied using the centers calculated from the FAMD individuals coordinates.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+nc = 2
+c1 <- cutree(hc,nc)
+cdg<- aggregate(as.data.frame(famd.NKI$ind$coord),list(c1),mean)[,2:(ncol(famd.NKI$ind$coord)+1)]
+Bss <- sum(rowSums(cdg^2)*as.numeric(table(c1)))
+Tss <- sum(rowSums(famd.NKI$ind$coord^2))
+Ib2 <- 100*Bss/Tss
+```
+
+The quality of the cut gives us a low value of `r Ib2`%. This low value can be a consequence of the decision of splitting the populations in only two clusters of individuals.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+kmeans = kmeans(as.data.frame(famd.NKI$ind$coord), centers=cdg)
+
+Bss <- sum(rowSums(kmeans$centers^2)*kmeans$size)
+Wss <- sum(kmeans$withinss)
+Ib2 <- 100*Bss/(Bss+Wss)
+```
+
+After having executed kmeans, we recompute the quality of the clustering: `r Ib2`%. Although there has been improved with regards to hierarchical clustering, we still consider it a low value.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+plot(famd.NKI$ind$coord[,1], famd.NKI$ind$coord[,2], col = kmeans$cluster)
+```
+
+Displaying the first factoral plane using the clusters as colors allows us to see the splitting between individuals. However, due to the low variance percentage given, we still rely on the rest of dimensions in order to have a major variance explained.
+
+Finally, the characteristics of each cluster are computed using the *catdes* method.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+catdesPlot = catdes(cbind(as.factor(kmeans$cluster),train_df_comp),1)
+```
+
+The first cluster can be identified by having:
+
+*   Quantitative variables:
+
+    +   Diameter larger than the mean.
+    +   High value of the 3rd Comp.
+    
+*   Qualitative variables:
+
+    +   Lymphocytic infiltration to the highest grade (2-3).
+    +   *Grade* 3 cancer.
+    +   Histological type to 1.
+
+The second cluster can be identified by having:
+
+*   Quantitative variables:
+
+    +   Timerecurrence higher than the average.
+    +   Higher age than the mean.
+    +   Higher values for the 8th and 18th component.
+    
+*   Qualitative variables:
+
+    +   Lymphocytic infiltration to the lowest grade (1).
+    +   *Grade* 1 or 2 cancer.
+    +   Angionvasive level to 1.
+    +   Histological type to 1 or 2.
+
+# Predictive methods
+
+Having a separated test set for we have 3 models to test against unseen data.
+
+## Generalized linear model
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+pred <- glm(eventdeath ~ ., data=as.data.frame(train_df_comp))
+NKI_comp <- rbind(pred_df, train_df_comp)
+    
+predictedData <- predict(pred, newdata=pred_df, type="response")
+
+acc <- getAccuracy(predictedData, pred_df[, 2], 0.65)
+```
+
+## Decision Trees
+
+Once our data of test and training has been defined, we are able to obtain the decision tree to predict whether the variable Adjusted on the training data. To do so, the rpart function has been used by defining the appropriate formula for prediction the eventdeath variable taking into consideration all the other variables chosen for the analysis, passing the training data and also defining the complexity parameter and the number of cross-validations for our model. The visual representation of the cross-validation results obtained for our calculated decision tree is showed below.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train_df_comp$eventdeath <- factor(train_df_comp$eventdeath)
+
+p2 = rpart(eventdeath~., data=train_df_comp, control=rpart.control(cp=0.001, xval=10))
+
+rpart.plot(p2)
+```
+
+We know that we obtain the optimal tree by pruning the maximal one up to the minimal cross-validation error. To decide the cutoff value for taking the decision more precisely, we have calculated the minimum error of our decision tree model.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE }
+predictedData <- predict(p2, pred_df[,-2], type="class")
+
+acc <- (length(which (predictedData == pred_df[,2], TRUE))/nrow(pred_df)) * 100.0
+
+p2$cptable = as.data.frame(p2$cptable) 
+ind = which.min(p2$cptable$xerror) 
+xerr <- p2$cptable$xerror[ind]
+xstd <- p2$cptable$xstd[ind]
+
+i= 1
+while (p2$cptable$xerror[i] > xerr+xstd) {
+    i = i+1
+    alfa = p2$cptable$CP[i]
+}
+# AND PRUNE THE TREE ACCORDINGLY
+p1 <- prune(p2,cp=alfa)
+
+rpart.plot(p1)
+
+# p1$variable.importance
+```
+
+After the tree is prunned, we predict the test samples. The resulting accuraccy is `r acc`%. We are surprised by the simplicity of the tree, only depending in one variable (among the 33 actual ones) extracted from the training samples. 
+
+## Random Forest
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train_df_comp$eventdeath <- as.character(train_df_comp$eventdeath)
+train_df_comp$eventdeath <- as.factor(train_df_comp$eventdeath)
+pred_df[,2] <- as.character(pred_df[,2])
+pred_df[,2] <- as.factor(pred_df[,2])
+
+names(pred_df) <- make.names(names(train_df_comp))
+names(train_df_comp) <- make.names(names(train_df_comp))
+
+p1.rf = randomForest(formula = eventdeath ~ ., data = train_df_comp,
+              importance = TRUE, xtest = pred_df[, c(1, 3:ncol(pred_df)) ], 
+             ytest = pred_df[ , 2], ntree = 2000, nodesize = 20, keep.forest=TRUE)
+
+plot(p1.rf)
+```
+
+In order to obtain the maximum possible accuracy, we have searched for the parameters that maximize the accuracy:
+
+*   ntree: Being the number of trees to create, this parameter is left with a high value (2000). The larger the value the maximum number of trees are created.
+
+*   nodesize: Minimum size of terminal nodes. Setting this number larger causes smaller trees to be grown (and thus take less time). The best value found is 20.
+
+*   mtry: Number of variables randomly sampled as candidates at each split. This parameter is left in default (since we do classification) being sqrt(#factors).
+
+The maximum accuracy obtained for the the random forests is `r acc` which is the same as the previous decision tree. Although random forests have a higher computational time, no prunning to obtain the optimal solution is needed.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+tree_func(p1.rf, 8)
+```
+
+Taking a look at the tree that resulted the best test accuracy, we can observe that the complexity (in terms of tree size and depth) is quite higher compared to the decicion tree, which only a single timerecurrence decision is needed.
+
